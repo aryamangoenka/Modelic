@@ -1,0 +1,348 @@
+"""
+Model loading and validation module for MLOps Platform
+Handles loading different ML model formats and running validation tests.
+"""
+
+import json
+import pickle
+import joblib
+import importlib.util
+import sys
+from pathlib import Path
+from typing import Dict, Any, Tuple, Optional, Callable
+import logging
+import traceback
+import time
+
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+class ModelValidationError(Exception):
+    """Raised when model validation fails."""
+    pass
+
+class ModelLoader:
+    """Handles loading and validation of ML models."""
+    
+    def __init__(self, repo_path: Path):
+        """
+        Initialize model loader.
+        
+        Args:
+            repo_path: Path to the cloned repository
+        """
+        self.repo_path = repo_path
+        self.model = None
+        self.predict_function: Optional[Callable] = None
+        self.model_file_path: Optional[Path] = None
+        self.test_data: Optional[Dict[str, Any]] = None
+        
+    def detect_model_type(self) -> Tuple[str, Path]:
+        """
+        Detect the type of model in the repository.
+        
+        Returns:
+            Tuple of (model_type, model_file_path)
+            
+        Raises:
+            ModelValidationError: If no valid model file is found
+        """
+        model_files = {
+            "sklearn_pickle": ["model.pkl"],
+            "sklearn_joblib": ["model.joblib"],
+            "pytorch": ["model.pt", "model.pth"],
+            "generic_pickle": ["model.pickle"]
+        }
+        
+        for model_type, file_patterns in model_files.items():
+            for pattern in file_patterns:
+                model_path = self.repo_path / pattern
+                if model_path.exists():
+                    logger.info(f"Detected {model_type} model: {model_path}")
+                    return model_type, model_path
+        
+        raise ModelValidationError("No supported model file found. Expected: model.pkl, model.joblib, model.pt, or model.pth")
+    
+    def load_model(self) -> Any:
+        """
+        Load the model from the detected file.
+        
+        Returns:
+            Loaded model object
+            
+        Raises:
+            ModelValidationError: If model loading fails
+        """
+        try:
+            model_type, model_path = self.detect_model_type()
+            self.model_file_path = model_path
+            
+            logger.info(f"Loading {model_type} model from {model_path}")
+            
+            if model_type in ["sklearn_pickle", "generic_pickle"]:
+                with open(model_path, 'rb') as f:
+                    self.model = pickle.load(f)
+                    
+            elif model_type == "sklearn_joblib":
+                self.model = joblib.load(model_path)
+                
+            elif model_type == "pytorch":
+                try:
+                    import torch
+                    self.model = torch.load(model_path, map_location='cpu')
+                    # Set to evaluation mode
+                    if hasattr(self.model, 'eval'):
+                        self.model.eval()
+                except ImportError:
+                    raise ModelValidationError("PyTorch not installed. Add torch>=2.0.0 to requirements.txt")
+            
+            logger.info(f"Successfully loaded model: {type(self.model)}")
+            return self.model
+            
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            raise ModelValidationError(f"Failed to load model: {str(e)}")
+    
+    def load_predict_function(self) -> Callable:
+        """
+        Load the predict.py file and extract the predict function.
+        
+        Returns:
+            Predict function
+            
+        Raises:
+            ModelValidationError: If predict.py is invalid
+        """
+        predict_file = self.repo_path / "predict.py"
+        
+        if not predict_file.exists():
+            raise ModelValidationError("predict.py file not found")
+        
+        try:
+            # Load the predict.py module dynamically
+            spec = importlib.util.spec_from_file_location("predict_module", predict_file)
+            predict_module = importlib.util.module_from_spec(spec)
+            
+            # Add repo path to sys.path so predict.py can import local files
+            original_path = sys.path.copy()
+            sys.path.insert(0, str(self.repo_path))
+            
+            try:
+                spec.loader.exec_module(predict_module)
+            finally:
+                # Restore original sys.path
+                sys.path = original_path
+            
+            # Get the predict function
+            if not hasattr(predict_module, 'predict'):
+                raise ModelValidationError("predict.py must contain a 'predict' function")
+            
+            self.predict_function = predict_module.predict
+            logger.info("Successfully loaded predict function")
+            return self.predict_function
+            
+        except Exception as e:
+            logger.error(f"Failed to load predict function: {e}")
+            raise ModelValidationError(f"Failed to load predict.py: {str(e)}")
+    
+    def load_test_data(self) -> Dict[str, Any]:
+        """
+        Load test data from test_data.json.
+        
+        Returns:
+            Test data dictionary
+            
+        Raises:
+            ModelValidationError: If test data is invalid
+        """
+        test_data_file = self.repo_path / "test_data.json"
+        
+        if not test_data_file.exists():
+            raise ModelValidationError("test_data.json file not found")
+        
+        try:
+            with open(test_data_file, 'r') as f:
+                self.test_data = json.load(f)
+            
+            logger.info(f"Loaded test data: {list(self.test_data.keys())}")
+            return self.test_data
+            
+        except json.JSONDecodeError as e:
+            raise ModelValidationError(f"Invalid JSON in test_data.json: {str(e)}")
+        except Exception as e:
+            raise ModelValidationError(f"Failed to load test data: {str(e)}")
+    
+    def validate_model(self) -> Dict[str, Any]:
+        """
+        Run complete model validation including loading and inference test.
+        
+        Returns:
+            Validation results dictionary
+            
+        Raises:
+            ModelValidationError: If validation fails
+        """
+        validation_results = {
+            "model_loaded": False,
+            "predict_function_loaded": False,
+            "test_data_loaded": False,
+            "inference_test_passed": False,
+            "model_type": None,
+            "model_file": None,
+            "test_prediction": None,
+            "test_latency_ms": None,
+            "errors": []
+        }
+        
+        try:
+            # Step 1: Load model
+            model = self.load_model()
+            validation_results["model_loaded"] = True
+            validation_results["model_type"] = type(model).__name__
+            validation_results["model_file"] = str(self.model_file_path.name)
+            
+            # Step 2: Load predict function
+            predict_func = self.load_predict_function()
+            validation_results["predict_function_loaded"] = True
+            
+            # Step 3: Load test data
+            test_data = self.load_test_data()
+            validation_results["test_data_loaded"] = True
+            
+            # Step 4: Run inference test
+            start_time = time.time()
+            prediction = predict_func(test_data)
+            end_time = time.time()
+            
+            # Validate prediction format (should follow API response format)
+            if not isinstance(prediction, dict):
+                raise ModelValidationError("Predict function must return a dictionary")
+            
+            if "prediction" not in prediction:
+                raise ModelValidationError("Prediction result must contain 'prediction' key")
+            
+            # Optional: check for confidence score
+            if "confidence" not in prediction:
+                logger.warning("Prediction result missing 'confidence' key (recommended)")
+            
+            validation_results["inference_test_passed"] = True
+            validation_results["test_prediction"] = prediction
+            validation_results["test_latency_ms"] = int((end_time - start_time) * 1000)
+            
+            logger.info(f"Model validation completed successfully in {validation_results['test_latency_ms']}ms")
+            
+        except Exception as e:
+            error_msg = f"Validation failed: {str(e)}"
+            logger.error(error_msg)
+            logger.error(traceback.format_exc())
+            validation_results["errors"].append(error_msg)
+            raise ModelValidationError(error_msg)
+        
+        return validation_results
+    
+    def get_model_info(self) -> Dict[str, Any]:
+        """
+        Get information about the loaded model.
+        
+        Returns:
+            Model information dictionary
+        """
+        if not self.model:
+            return {"error": "No model loaded"}
+        
+        info = {
+            "model_type": type(self.model).__name__,
+            "model_file": str(self.model_file_path.name) if self.model_file_path else None,
+            "has_predict_function": self.predict_function is not None,
+            "has_test_data": self.test_data is not None
+        }
+        
+        # Try to get additional model-specific info
+        try:
+            if hasattr(self.model, 'get_params'):
+                # Sklearn model
+                info["sklearn_params"] = self.model.get_params()
+                
+            if hasattr(self.model, 'feature_names_in_'):
+                # Sklearn with feature names
+                info["feature_names"] = list(self.model.feature_names_in_)
+                
+            if hasattr(self.model, 'n_features_in_'):
+                # Sklearn with feature count
+                info["n_features"] = self.model.n_features_in_
+                
+        except Exception as e:
+            logger.debug(f"Could not extract additional model info: {e}")
+        
+        return info
+
+async def validate_model_repository(repo_path: Path) -> Dict[str, Any]:
+    """
+    Complete model repository validation (updated from main.py).
+    
+    Args:
+        repo_path: Path to the cloned repository
+        
+    Returns:
+        Comprehensive validation results
+    """
+    # First check file structure (existing logic)
+    required_files = ["requirements.txt", "predict.py", "test_data.json"]
+    model_files = ["model.pkl", "model.pt", "model.pth", "model.joblib"]
+    
+    errors = []
+    found_files = []
+    
+    # Check for required files
+    for file_name in required_files:
+        file_path = repo_path / file_name
+        if file_path.exists():
+            found_files.append(file_name)
+        else:
+            errors.append(f"Missing required file: {file_name}")
+    
+    # Check for at least one model file
+    model_file_found = False
+    for model_file in model_files:
+        if (repo_path / model_file).exists():
+            model_file_found = True
+            found_files.append(model_file)
+            break
+    
+    if not model_file_found:
+        errors.append(f"Missing model file. Expected one of: {', '.join(model_files)}")
+    
+    validation_result = {
+        "structure_valid": len(errors) == 0,
+        "structure_errors": errors,
+        "found_files": found_files,
+        "repo_path": str(repo_path)
+    }
+    
+    # If structure is valid, run model validation
+    if validation_result["structure_valid"]:
+        try:
+            loader = ModelLoader(repo_path)
+            model_validation = loader.validate_model()
+            validation_result.update(model_validation)
+            validation_result["model_validation_passed"] = True
+            
+        except ModelValidationError as e:
+            validation_result["model_validation_passed"] = False
+            validation_result["model_validation_error"] = str(e)
+            logger.error(f"Model validation failed: {e}")
+        except Exception as e:
+            validation_result["model_validation_passed"] = False
+            validation_result["model_validation_error"] = f"Unexpected error: {str(e)}"
+            logger.error(f"Unexpected validation error: {e}")
+    else:
+        validation_result["model_validation_passed"] = False
+        validation_result["model_validation_error"] = "Repository structure validation failed"
+    
+    logger.info(
+        f"Repository validation completed - Structure: {validation_result['structure_valid']}, "
+        f"Model: {validation_result.get('model_validation_passed', False)}"
+    )
+    
+    return validation_result 

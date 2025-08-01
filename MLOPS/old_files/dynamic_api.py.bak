@@ -1,0 +1,360 @@
+"""
+Dynamic API generation for MLOps Platform
+Creates unique FastAPI endpoints for each deployed model.
+"""
+
+import time
+import uuid
+from pathlib import Path
+from typing import Dict, Any, Optional, Callable
+import logging
+import traceback
+import importlib.util
+import sys
+
+from fastapi import APIRouter, HTTPException, status
+from pydantic import BaseModel
+import asyncio
+
+from database import log_inference, ModelMetadata
+
+logger = logging.getLogger(__name__)
+
+# Global model registry to store loaded models
+model_registry: Dict[str, Dict[str, Any]] = {}
+
+class PredictionRequest(BaseModel):
+    """Standard prediction request format."""
+    data: Dict[str, Any]
+
+class PredictionResponse(BaseModel):
+    """Standard prediction response format."""
+    prediction: Any
+    confidence: Optional[float] = None
+    model_version: str
+    inference_time_ms: int
+    model_id: str
+
+class ModelDeploymentError(Exception):
+    """Raised when model deployment fails."""
+    pass
+
+class ModelAPI:
+    """Manages dynamic API creation for individual models."""
+    
+    def __init__(self, model_metadata: ModelMetadata, repo_path: Path):
+        """
+        Initialize model API.
+        
+        Args:
+            model_metadata: Model metadata from database
+            repo_path: Path to the cloned repository
+        """
+        self.model_metadata = model_metadata
+        self.repo_path = repo_path
+        self.predict_function: Optional[Callable] = None
+        self.router = APIRouter()
+        self._setup_routes()
+    
+    def _load_predict_function(self) -> Callable:
+        """
+        Load the predict function from predict.py.
+        
+        Returns:
+            Predict function
+            
+        Raises:
+            ModelDeploymentError: If loading fails
+        """
+        predict_file = self.repo_path / "predict.py"
+        
+        if not predict_file.exists():
+            raise ModelDeploymentError("predict.py file not found")
+        
+        try:
+            # Load the predict.py module dynamically with unique name
+            module_name = f"predict_module_{self.model_metadata.id}"
+            spec = importlib.util.spec_from_file_location(module_name, predict_file)
+            predict_module = importlib.util.module_from_spec(spec)
+            
+            # Add repo path to sys.path so predict.py can import local files
+            original_path = sys.path.copy()
+            sys.path.insert(0, str(self.repo_path))
+            
+            try:
+                spec.loader.exec_module(predict_module)
+            finally:
+                # Restore original sys.path
+                sys.path = original_path
+            
+            # Get the predict function
+            if not hasattr(predict_module, 'predict'):
+                raise ModelDeploymentError("predict.py must contain a 'predict' function")
+            
+            self.predict_function = predict_module.predict
+            logger.info(f"Loaded predict function for model {self.model_metadata.id}")
+            return self.predict_function
+            
+        except Exception as e:
+            logger.error(f"Failed to load predict function: {e}")
+            raise ModelDeploymentError(f"Failed to load predict.py: {str(e)}")
+    
+    def _setup_routes(self):
+        """Setup FastAPI routes for this model."""
+        
+        @self.router.post(
+            f"/predict",
+            response_model=PredictionResponse,
+            summary=f"Predict using {self.model_metadata.name}",
+            description=f"Run inference on model {self.model_metadata.name} ({self.model_metadata.version})"
+        )
+        async def predict(request: PredictionRequest) -> PredictionResponse:
+            """
+            Run prediction on the model.
+            
+            Args:
+                request: Prediction request with input data
+                
+            Returns:
+                Prediction response with results
+                
+            Raises:
+                HTTPException: If prediction fails
+            """
+            start_time = time.time()
+            
+            try:
+                # Ensure predict function is loaded
+                if not self.predict_function:
+                    self.predict_function = self._load_predict_function()
+                
+                # Run prediction
+                prediction_result = self.predict_function(request.data)
+                
+                # Validate response format
+                if not isinstance(prediction_result, dict):
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Invalid prediction format: must return dictionary"
+                    )
+                
+                if "prediction" not in prediction_result:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Invalid prediction format: missing 'prediction' key"
+                    )
+                
+                end_time = time.time()
+                latency_ms = int((end_time - start_time) * 1000)
+                
+                # Create response
+                response = PredictionResponse(
+                    prediction=prediction_result["prediction"],
+                    confidence=prediction_result.get("confidence"),
+                    model_version=self.model_metadata.version,
+                    inference_time_ms=latency_ms,
+                    model_id=self.model_metadata.id
+                )
+                
+                # Log inference asynchronously
+                asyncio.create_task(log_inference(
+                    model_id=self.model_metadata.id,
+                    input_data=request.data,
+                    prediction=prediction_result,
+                    latency_ms=latency_ms,
+                    status="success"
+                ))
+                
+                logger.info(f"Successful prediction for model {self.model_metadata.id} in {latency_ms}ms")
+                return response
+                
+            except HTTPException:
+                raise
+            except Exception as e:
+                end_time = time.time()
+                latency_ms = int((end_time - start_time) * 1000)
+                
+                error_msg = f"Prediction failed: {str(e)}"
+                logger.error(f"Prediction error for model {self.model_metadata.id}: {error_msg}")
+                logger.error(traceback.format_exc())
+                
+                # Log failed inference
+                asyncio.create_task(log_inference(
+                    model_id=self.model_metadata.id,
+                    input_data=request.data,
+                    prediction={"error": error_msg},
+                    latency_ms=latency_ms,
+                    status="error"
+                ))
+                
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail={"error": error_msg, "trace": type(e).__name__}
+                )
+        
+        @self.router.get(
+            f"/info",
+            summary=f"Get info for {self.model_metadata.name}",
+            description=f"Get metadata and information about model {self.model_metadata.name}"
+        )
+        async def get_model_info() -> Dict[str, Any]:
+            """
+            Get model information and metadata.
+            
+            Returns:
+                Model information dictionary
+            """
+            return {
+                "model_id": self.model_metadata.id,
+                "name": self.model_metadata.name,
+                "version": self.model_metadata.version,
+                "status": self.model_metadata.status,
+                "github_repo": self.model_metadata.github_repo,
+                "created_at": self.model_metadata.created_at.isoformat(),
+                "updated_at": self.model_metadata.updated_at.isoformat(),
+                "endpoint_path": f"/models/{self.model_metadata.id}",
+                "predict_endpoint": f"/models/{self.model_metadata.id}/predict",
+                "info_endpoint": f"/models/{self.model_metadata.id}/info"
+            }
+        
+        @self.router.get(
+            f"/health",
+            summary=f"Health check for {self.model_metadata.name}",
+            description=f"Check if model {self.model_metadata.name} is ready for inference"
+        )
+        async def health_check() -> Dict[str, Any]:
+            """
+            Check if the model is healthy and ready for inference.
+            
+            Returns:
+                Health status dictionary
+            """
+            try:
+                # Try to load predict function if not already loaded
+                if not self.predict_function:
+                    self.predict_function = self._load_predict_function()
+                
+                return {
+                    "status": "healthy",
+                    "model_id": self.model_metadata.id,
+                    "ready_for_inference": True,
+                    "last_checked": time.time()
+                }
+            except Exception as e:
+                return {
+                    "status": "unhealthy",
+                    "model_id": self.model_metadata.id,
+                    "ready_for_inference": False,
+                    "error": str(e),
+                    "last_checked": time.time()
+                }
+
+def register_model_api(
+    model_metadata: ModelMetadata,
+    repo_path: Path,
+    main_app
+) -> str:
+    """
+    Register a new model API with the main FastAPI application.
+    
+    Args:
+        model_metadata: Model metadata
+        repo_path: Path to the model repository
+        main_app: Main FastAPI application instance
+        
+    Returns:
+        The endpoint URL for the deployed model
+        
+    Raises:
+        ModelDeploymentError: If registration fails
+    """
+    try:
+        # Create model API
+        model_api = ModelAPI(model_metadata, repo_path)
+        
+        # Create unique path for this model
+        model_path = f"/models/{model_metadata.id}"
+        
+        # Include the router in the main app
+        main_app.include_router(
+            model_api.router,
+            prefix=model_path,
+            tags=[f"Model: {model_metadata.name}"]
+        )
+        
+        # Store in registry
+        model_registry[model_metadata.id] = {
+            "metadata": model_metadata,
+            "api": model_api,
+            "repo_path": repo_path,
+            "endpoint_url": model_path,
+            "registered_at": time.time()
+        }
+        
+        endpoint_url = f"{model_path}/predict"
+        logger.info(f"Registered model API: {endpoint_url}")
+        
+        return endpoint_url
+        
+    except Exception as e:
+        logger.error(f"Failed to register model API: {e}")
+        raise ModelDeploymentError(f"Failed to register model API: {str(e)}")
+
+def unregister_model_api(model_id: str, main_app) -> bool:
+    """
+    Unregister a model API from the main application.
+    
+    Args:
+        model_id: Model ID to unregister
+        main_app: Main FastAPI application instance
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    if model_id in model_registry:
+        try:
+            # Remove from registry
+            del model_registry[model_id]
+            
+            # Note: FastAPI doesn't have a built-in way to remove routers
+            # In production, you might want to restart the server or use
+            # a more sophisticated routing solution
+            
+            logger.info(f"Unregistered model API: {model_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to unregister model API {model_id}: {e}")
+            return False
+    
+    return False
+
+def get_registered_models() -> Dict[str, Dict[str, Any]]:
+    """
+    Get all registered models.
+    
+    Returns:
+        Dictionary of registered models
+    """
+    return {
+        model_id: {
+            "model_id": model_data["metadata"].id,
+            "name": model_data["metadata"].name,
+            "version": model_data["metadata"].version,
+            "status": model_data["metadata"].status,
+            "endpoint_url": model_data["endpoint_url"],
+            "registered_at": model_data["registered_at"]
+        }
+        for model_id, model_data in model_registry.items()
+    }
+
+def is_model_registered(model_id: str) -> bool:
+    """
+    Check if a model is registered.
+    
+    Args:
+        model_id: Model ID to check
+        
+    Returns:
+        True if registered, False otherwise
+    """
+    return model_id in model_registry 

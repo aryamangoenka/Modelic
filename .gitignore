@@ -154,17 +154,17 @@ Thumbs.db
 dump.rdb
 
 # Frontend (Next.js) specific
-frontend/.next/
-frontend/node_modules/
-frontend/.env.local
-frontend/.env.development.local
-frontend/.env.test.local
-frontend/.env.production.local
-frontend/tsconfig.tsbuildinfo
-frontend/.turbo/
-frontend/out/
-frontend/build/
-frontend/dist/
+**/frontend/.next/
+**/frontend/node_modules/
+**/frontend/.env.local
+**/frontend/.env.development.local
+**/frontend/.env.test.local
+**/frontend/.env.production.local
+**/frontend/tsconfig.tsbuildinfo
+**/frontend/.turbo/
+**/frontend/out/
+**/frontend/build/
+**/frontend/dist/
 
 # Package managers
 package-lock.json
@@ -172,4 +172,5 @@ yarn.lock
 pnpm-lock.yaml
 
 # Local env files
-*.local node_modules/
+*.local
+**/node_modules/
