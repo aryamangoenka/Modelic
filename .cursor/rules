@@ -1,0 +1,67 @@
+{
+  "project_name": "Vercel for ML - MLOps Automation Platform",
+  "context": "This project enables users to deploy ML models by simply pushing to GitHub. It validates, serves, monitors, and alerts on drift automatically. Designed for data scientists who want zero DevOps overhead.",
+  "architecture_rules": [
+    "Use FastAPI as the only backend web framework.",
+    "Use Supabase for both metadata storage and file storage (e.g., model files).",
+    "Use Celery with Redis for background tasks (model validation, deployment, drift analysis).",
+    "Serve all ML models through dynamically created FastAPI routes with proper versioning.",
+    "Inference APIs must always respond with JSON: { prediction, confidence }.",
+    "Drift monitoring must use PSI and KL Divergence only."
+  ],
+  "stack_preferences": {
+    "frontend": "Next.js",
+    "backend": "FastAPI + Celery + Redis",
+    "database": "Supabase (PostgreSQL)",
+    "storage": "Supabase Storage",
+    "auth": "Clerk.dev or Auth0 (MVP phase)",
+    "LLM_usage": "Use OpenAI GPT-4 for drift explanations and summarizing model alerts (Phase 2+)."
+  },
+  "code_style": {
+    "python": {
+      "typing": "Always use type hints and Pydantic models",
+      "async": "Use async def where possible in FastAPI routes",
+      "logging": "Use Python logging module; no print statements",
+      "error_handling": "Gracefully handle errors with custom exceptions and FastAPI handlers",
+      "modularity": "All code must follow a layered architecture: routers (api) → services → utils/models. No business logic should be in the route handler. Use dependency injection and break large functions into smaller units."
+
+    },
+    "frontend": {
+      "typescript": "Use TypeScript across the codebase",
+      "css": "Use Tailwind CSS and shadcn/ui"
+    }
+  },
+  "devops_notes": [
+    "Do not use Kubernetes or TorchServe in MVP phase.",
+    "Deployment is handled via Supabase functions or lightweight EC2/GCP VM.",
+    "All deployment should assume models are CPU-bound initially.",
+    "No Docker per-model yet — keep deployment lightweight."
+  ],
+  "ui_rules": [
+    "Dashboard must show model status, API endpoint, logs, and drift reports.",
+    "Use charts (Recharts or Chart.js) for metrics visualization.",
+    "Include 'Test Inference' section on each model page."
+  ],
+  "excluded_tech": [
+    "Django",
+    "Kubernetes",
+    "Flask (except in legacy tests)",
+    "TorchServe (for now)",
+    "Third-party MLOps platforms (no integration in MVP)"
+  ],
+  "custom_conventions": {
+    "model_repo_structure": [
+      "model.pkl or model.pt",
+      "requirements.txt",
+      "predict.py",
+      "test_data.json"
+    ],
+    "api_response_format": {
+      "success": "{ 'prediction': ..., 'confidence': ..., 'model_version': ... }",
+      "error": "{ 'error': ..., 'trace': ... }"
+    }
+  }
+  
+  
+
+}
